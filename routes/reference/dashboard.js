@@ -89,7 +89,7 @@ const errorMessage = err => {
     return err.message;
   } else {
     return "An unknown error occurred";
-  }
+  } 
 };
 
 // 전염병 발생 데이터 조회

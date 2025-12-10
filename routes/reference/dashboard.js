@@ -7,6 +7,7 @@ const Joi = require("joi");
 const { Op, QueryTypes } = require("sequelize");
 const axios = require("axios");
 const xml2js = require("xml2js");
+const cron = require("node-cron");
 const LivestockDiseaseOccurrence = require("../../models/reference/LivestockDiseaseOccurrence");
 const LivestockDiseasePrediction = require("../../models/reference/LivestockDiseasePrediction");
 
@@ -538,11 +539,9 @@ async function processAndUpsertRows(rows, status = null) {
   return { upserted, errors };
 }
 
-// 질병 발생 예측 생성
-router.post("/disease-occurrence/predict", async (req, res) => {
+// 질병 발생 예측 생성 함수 (재사용 가능하도록 분리)
+async function generatePredictions(months = 3) {
   try {
-    const { months = 3 } = req.body; // 예측할 개월 수 (기본 3개월)
-
     logger.info(`질병 발생 예측 시작: ${months}개월 예측`);
 
     // 기존 예측 데이터 삭제 (재생성)
@@ -824,7 +823,7 @@ router.post("/disease-occurrence/predict", async (req, res) => {
 
     logger.info(`질병 발생 예측 완료: ${predictions.length}개 예측 데이터 생성`);
 
-    res.status(200).json({
+    return {
       result: true,
       message: `질병 발생 예측이 완료되었습니다. ${predictions.length}개의 예측 데이터가 생성되었습니다.`,
       data: {
@@ -832,7 +831,19 @@ router.post("/disease-occurrence/predict", async (req, res) => {
         months,
         generatedAt: new Date().toISOString(),
       },
-    });
+    };
+  } catch (error) {
+    logger.error(`Error generating predictions: ${error.message}`);
+    throw error;
+  }
+}
+
+// 질병 발생 예측 생성 API
+router.post("/disease-occurrence/predict", async (req, res) => {
+  try {
+    const { months = 3 } = req.body; // 예측할 개월 수 (기본 3개월)
+    const result = await generatePredictions(months);
+    res.status(200).json(result);
   } catch (error) {
     logger.error(`Error generating predictions: ${error.message}`);
     res.status(500).json({
@@ -940,5 +951,22 @@ router.get("/disease-occurrence/predict/statistics", async (req, res) => {
     });
   }
 });
+
+// 매일 새벽 1시에 자동으로 예측 생성
+// cron 표현식: "0 1 * * *" = 매일 01:00에 실행
+cron.schedule("0 1 * * *", async () => {
+  try {
+    logger.info("⏰ 스케줄러: 자동 예측 생성 시작 (새벽 1시)");
+    const result = await generatePredictions(3); // 3개월 예측
+    logger.info(`✅ 스케줄러: 자동 예측 생성 완료 - ${result.data.totalPredictions}개 예측 데이터 생성`);
+  } catch (error) {
+    logger.error(`❌ 스케줄러: 자동 예측 생성 실패 - ${error.message}`);
+  }
+}, {
+  scheduled: true,
+  timezone: "Asia/Seoul", // 한국 시간대
+});
+
+logger.info("📅 예측 자동 스케줄러가 등록되었습니다. (매일 새벽 1시 실행)");
 
 module.exports = router;

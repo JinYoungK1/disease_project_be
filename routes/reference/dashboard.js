@@ -8,6 +8,7 @@ const { Op, QueryTypes } = require("sequelize");
 const axios = require("axios");
 const xml2js = require("xml2js");
 const LivestockDiseaseOccurrence = require("../../models/reference/LivestockDiseaseOccurrence");
+const LivestockDiseasePrediction = require("../../models/reference/LivestockDiseasePrediction");
 
 const logger = require("../../logs/logger");
 const dotenv = require("dotenv");
@@ -61,7 +62,7 @@ const deliverymanagementSchema = Joi.object({
   delivery_inprice_name: Joi.string().allow(null, ""),
   delivery_inprice_detail: Joi.string().allow(null, ""),
 });
- 
+
 const ordermanagementSchema = Joi.object({
   start_name: Joi.string().allow(null, ""),
   start_business_number: Joi.string().allow(null, ""),
@@ -89,7 +90,7 @@ const errorMessage = err => {
     return err.message;
   } else {
     return "An unknown error occurred";
-  } 
+  }
 };
 
 // 전염병 발생 데이터 조회
@@ -536,5 +537,408 @@ async function processAndUpsertRows(rows, status = null) {
 
   return { upserted, errors };
 }
+
+// 질병 발생 예측 생성
+router.post("/disease-occurrence/predict", async (req, res) => {
+  try {
+    const { months = 3 } = req.body; // 예측할 개월 수 (기본 3개월)
+
+    logger.info(`질병 발생 예측 시작: ${months}개월 예측`);
+
+    // 기존 예측 데이터 삭제 (재생성)
+    await LivestockDiseasePrediction.destroy({ where: {} });
+
+    const predictions = [];
+    const today = new Date();
+    const endDate = new Date(today);
+    endDate.setMonth(endDate.getMonth() + months);
+
+    // 모든 전염병 목록 가져오기
+    const diseases = await sequelize.query(
+      `SELECT DISTINCT lknts_nm 
+       FROM livestock_disease_occurrence 
+       WHERE lknts_nm IS NOT NULL`,
+      { type: QueryTypes.SELECT }
+    );
+
+    for (const disease of diseases) {
+      const diseaseName = disease.lknts_nm;
+      
+      // 전체 과거 데이터 분석 (제한 없이)
+      const allHistoricalData = await sequelize.query(
+        `SELECT 
+          SUBSTRING(occrrnc_de, 1, 4) AS year,
+          SUBSTRING(occrrnc_de, 5, 2) AS month,
+          occrrnc_de AS full_date,
+          COUNT(*) AS occurrence_count,
+          AVG(occrrnc_lvstckcnt) AS avg_livestock_count,
+          SUM(occrrnc_lvstckcnt) AS total_livestock_count,
+          STDDEV(occrrnc_lvstckcnt) AS std_dev
+        FROM livestock_disease_occurrence
+        WHERE lknts_nm = :diseaseName
+          AND occrrnc_de IS NOT NULL
+          AND occrrnc_lvstckcnt IS NOT NULL
+        GROUP BY SUBSTRING(occrrnc_de, 1, 4), SUBSTRING(occrrnc_de, 5, 2), occrrnc_de
+        ORDER BY year ASC, month ASC`,
+        {
+          replacements: { diseaseName },
+          type: QueryTypes.SELECT,
+        }
+      );
+
+      if (allHistoricalData.length === 0) continue;
+
+      // 전체 통계 분석
+      const overallStats = await sequelize.query(
+        `SELECT 
+          COUNT(*) AS total_occurrences,
+          AVG(occrrnc_lvstckcnt) AS overall_avg,
+          STDDEV(occrrnc_lvstckcnt) AS overall_stddev,
+          MIN(occrrnc_lvstckcnt) AS min_count,
+          MAX(occrrnc_lvstckcnt) AS max_count,
+          MIN(occrrnc_de) AS first_occurrence,
+          MAX(occrrnc_de) AS last_occurrence
+        FROM livestock_disease_occurrence
+        WHERE lknts_nm = :diseaseName
+          AND occrrnc_lvstckcnt IS NOT NULL`,
+        {
+          replacements: { diseaseName },
+          type: QueryTypes.SELECT,
+        }
+      );
+
+      const stats = overallStats[0];
+
+      // 월별 상세 통계 (전체 데이터 기반)
+      const monthlyStats = {};
+      const monthlyData = await sequelize.query(
+        `SELECT 
+          SUBSTRING(occrrnc_de, 5, 2) AS month,
+          COUNT(*) AS occurrence_count,
+          AVG(occrrnc_lvstckcnt) AS avg_count,
+          SUM(occrrnc_lvstckcnt) AS total_count,
+          STDDEV(occrrnc_lvstckcnt) AS stddev_count,
+          MIN(occrrnc_lvstckcnt) AS min_count,
+          MAX(occrrnc_lvstckcnt) AS max_count
+        FROM livestock_disease_occurrence
+        WHERE lknts_nm = :diseaseName
+          AND occrrnc_de IS NOT NULL
+          AND occrrnc_lvstckcnt IS NOT NULL
+        GROUP BY SUBSTRING(occrrnc_de, 5, 2)
+        ORDER BY month ASC`,
+        {
+          replacements: { diseaseName },
+          type: QueryTypes.SELECT,
+        }
+      );
+
+      monthlyData.forEach(row => {
+        const month = parseInt(row.month);
+        monthlyStats[month] = {
+          occurrence_count: parseInt(row.occurrence_count || 0),
+          avg_count: parseFloat(row.avg_count || 0),
+          total_count: parseFloat(row.total_count || 0),
+          stddev_count: parseFloat(row.stddev_count || 0),
+          min_count: parseInt(row.min_count || 0),
+          max_count: parseInt(row.max_count || 0),
+        };
+      });
+
+      // 발생 날짜 패턴 분석 (월별 발생 빈도)
+      const monthlyOccurrencePattern = {};
+      monthlyData.forEach(row => {
+        const month = parseInt(row.month);
+        monthlyOccurrencePattern[month] = {
+          occurrence_count: parseInt(row.occurrence_count || 0),
+          avg_days_between: 0, // 월별 평균 발생 간격
+        };
+      });
+
+      // 전체 발생 빈도 계산
+      const totalOccurrences = parseInt(stats.total_occurrences || 0);
+      const avgOccurrencesPerMonth = totalOccurrences / 12; // 월평균 발생 횟수
+
+      // 예측 생성 (다음 N개월 중 발생 가능한 날짜 예측)
+      const currentDate = new Date(today);
+      currentDate.setDate(1); // 월 초일로 설정
+
+      while (currentDate <= endDate) {
+        const year = currentDate.getFullYear();
+        const month = currentDate.getMonth() + 1;
+
+        // 해당 월의 발생 패턴 분석
+        const monthData = monthlyStats[month];
+        let confidence = 0;
+        let basis = {};
+
+        if (monthData && monthData.occurrence_count > 0) {
+          // 해당 월에 과거 발생 빈도가 높은 경우
+          const monthlyFrequency = monthData.occurrence_count;
+          const monthlyRatio = monthlyFrequency / avgOccurrencesPerMonth; // 월별 발생 비율
+
+          // 발생 가능성 계산 (발생 빈도가 평균보다 높으면 발생 가능성 높음)
+          const occurrenceProbability = Math.min(100, Math.round(monthlyRatio * 50));
+
+          // 신뢰도 계산
+          let confidenceFactors = 0;
+          let maxFactors = 0;
+
+          // 월별 발생 빈도 (최대 40점)
+          maxFactors += 40;
+          const frequencyScore = Math.min(40, (monthlyFrequency / 10) * 40);
+          confidenceFactors += frequencyScore;
+
+          // 전체 데이터 양 (최대 30점)
+          maxFactors += 30;
+          const totalDataScore = Math.min(30, (totalOccurrences / 200) * 30);
+          confidenceFactors += totalDataScore;
+
+          // 데이터 일관성 (최대 30점)
+          maxFactors += 30;
+          if (monthData.stddev_count > 0 && monthData.avg_count > 0) {
+            const cv = monthData.stddev_count / monthData.avg_count;
+            const consistencyScore = Math.max(0, 30 - (cv * 15));
+            confidenceFactors += consistencyScore;
+          } else {
+            confidenceFactors += 15; // 기본 점수
+          }
+
+          confidence = Math.round((confidenceFactors / maxFactors) * 100);
+
+          // 위험도 계산 (발생 빈도 기반)
+          let riskLevel = "LOW";
+          if (monthlyFrequency >= 20) riskLevel = "CRITICAL";
+          else if (monthlyFrequency >= 10) riskLevel = "HIGH";
+          else if (monthlyFrequency >= 5) riskLevel = "MEDIUM";
+
+          basis = {
+            method: "date_pattern_analysis",
+            monthlyOccurrenceFrequency: monthlyFrequency,
+            monthlyRatio: monthlyRatio.toFixed(2),
+            occurrenceProbability: occurrenceProbability,
+            totalHistoricalOccurrences: totalOccurrences,
+            avgOccurrencesPerMonth: avgOccurrencesPerMonth.toFixed(2),
+            dataPoints: allHistoricalData.length,
+          };
+
+          // 해당 월에 발생 가능한 날짜들을 예측
+          // 과거 데이터에서 해당 월의 발생 날짜 패턴 분석
+          const historicalDates = await sequelize.query(
+            `SELECT 
+              SUBSTRING(occrrnc_de, 7, 2) AS day,
+              COUNT(*) AS occurrence_count
+            FROM livestock_disease_occurrence
+            WHERE lknts_nm = :diseaseName
+              AND SUBSTRING(occrrnc_de, 5, 2) = :month
+              AND occrrnc_de IS NOT NULL
+            GROUP BY SUBSTRING(occrrnc_de, 7, 2)
+            ORDER BY occurrence_count DESC
+            LIMIT 5`,
+            {
+              replacements: { 
+                diseaseName,
+                month: String(month).padStart(2, "0")
+              },
+              type: QueryTypes.SELECT,
+            }
+          );
+
+          // 발생 가능한 날짜들 생성
+          if (historicalDates.length > 0) {
+            // 과거 발생 빈도가 높은 날짜들을 예측 날짜로 사용
+            for (const datePattern of historicalDates) {
+              const day = parseInt(datePattern.day);
+              const predictionDateStr = `${year}${String(month).padStart(2, "0")}${String(day).padStart(2, "0")}`;
+              
+              // 유효한 날짜인지 확인
+              const checkDate = new Date(year, month - 1, day);
+              if (checkDate.getMonth() === month - 1 && checkDate.getDate() === day) {
+                const dateBasis = {
+                  ...basis,
+                  historicalDayOccurrences: parseInt(datePattern.occurrence_count),
+                  predictionReason: `과거 ${month}월 ${day}일에 ${datePattern.occurrence_count}회 발생`,
+                };
+
+                predictions.push({
+                  prediction_date: predictionDateStr,
+                  lknts_nm: diseaseName,
+                  predicted_livestock_count: null,
+                  confidence_score: confidence,
+                  prediction_basis: JSON.stringify(dateBasis),
+                  region: null,
+                  risk_level: riskLevel,
+                });
+              }
+            }
+          } else {
+            // 과거 날짜 패턴이 없는 경우, 월 중순(15일)을 예측 날짜로 사용
+            const predictionDateStr = `${year}${String(month).padStart(2, "0")}15`;
+            const dateBasis = {
+              ...basis,
+              predictionReason: "과거 데이터 패턴 기반 월 중순 예측",
+            };
+
+            predictions.push({
+              prediction_date: predictionDateStr,
+              lknts_nm: diseaseName,
+              predicted_livestock_count: null,
+              confidence_score: Math.max(30, confidence - 20), // 신뢰도 조정
+              prediction_basis: JSON.stringify(dateBasis),
+              region: null,
+              risk_level: riskLevel,
+            });
+          }
+        } else {
+          // 해당 월에 과거 발생 데이터가 없는 경우, 낮은 신뢰도로 예측
+          const predictionDateStr = `${year}${String(month).padStart(2, "0")}15`;
+          confidence = Math.min(30, Math.round((totalOccurrences / 500) * 30));
+          
+          basis = {
+            method: "low_confidence_prediction",
+            totalOccurrences: totalOccurrences,
+            reason: "해당 월에 과거 발생 데이터가 없음",
+          };
+
+          predictions.push({
+            prediction_date: predictionDateStr,
+            lknts_nm: diseaseName,
+            predicted_livestock_count: null,
+            confidence_score: confidence,
+            prediction_basis: JSON.stringify(basis),
+            region: null,
+            risk_level: "LOW",
+          });
+        }
+
+        // 다음 달로 이동
+        currentDate.setMonth(currentDate.getMonth() + 1);
+      }
+    }
+
+    // 예측 데이터 일괄 저장
+    if (predictions.length > 0) {
+      await LivestockDiseasePrediction.bulkCreate(predictions, {
+        ignoreDuplicates: true,
+      });
+    }
+
+    logger.info(`질병 발생 예측 완료: ${predictions.length}개 예측 데이터 생성`);
+
+    res.status(200).json({
+      result: true,
+      message: `질병 발생 예측이 완료되었습니다. ${predictions.length}개의 예측 데이터가 생성되었습니다.`,
+      data: {
+        totalPredictions: predictions.length,
+        months,
+        generatedAt: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    logger.error(`Error generating predictions: ${error.message}`);
+    res.status(500).json({
+      result: false,
+      message: "Internal Server Error",
+      error: error.message,
+    });
+  }
+});
+
+// 예측 데이터 조회
+router.get("/disease-occurrence/predict", async (req, res) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+
+    const where = {};
+    if (req.query.lknts_nm) {
+      where.lknts_nm = { [Op.like]: `%${req.query.lknts_nm}%` };
+    }
+    if (req.query.prediction_date) {
+      where.prediction_date = { [Op.like]: `${req.query.prediction_date}%` };
+    }
+    if (req.query.region) {
+      where.region = { [Op.like]: `%${req.query.region}%` };
+    }
+    if (req.query.risk_level) {
+      where.risk_level = req.query.risk_level;
+    }
+
+    const { count, rows } = await LivestockDiseasePrediction.findAndCountAll({
+      where,
+      limit,
+      offset,
+      order: [["prediction_date", "ASC"], ["risk_level", "DESC"]],
+    });
+
+    // JSON 파싱
+    const predictions = rows.map(row => {
+      const data = row.toJSON();
+      if (data.prediction_basis) {
+        try {
+          data.prediction_basis = JSON.parse(data.prediction_basis);
+        } catch (e) {
+          data.prediction_basis = {};
+        }
+      }
+      return data;
+    });
+
+    res.status(200).json({
+      result: true,
+      message: "예측 데이터 조회 성공",
+      data: {
+        list: predictions,
+        pagination: {
+          total: count,
+          page,
+          limit,
+          totalPages: Math.ceil(count / limit),
+        },
+      },
+    });
+  } catch (error) {
+    logger.error(`Error fetching predictions: ${error.message}`);
+    res.status(500).json({
+      result: false,
+      message: "Internal Server Error",
+      error: error.message,
+    });
+  }
+});
+
+// 예측 통계 조회
+router.get("/disease-occurrence/predict/statistics", async (req, res) => {
+  try {
+    const statistics = await sequelize.query(
+      `SELECT 
+        lknts_nm AS diseaseName,
+        risk_level AS riskLevel,
+        COUNT(*) AS predictionCount,
+        AVG(confidence_score) AS avgConfidence,
+        MIN(prediction_date) AS earliestPrediction,
+        MAX(prediction_date) AS latestPrediction
+      FROM livestock_disease_prediction
+      GROUP BY lknts_nm, risk_level
+      ORDER BY predictionCount DESC, avgConfidence DESC`,
+      {
+        type: QueryTypes.SELECT,
+      }
+    );
+
+    res.status(200).json({
+      result: true,
+      message: "예측 통계 조회 성공",
+      data: statistics,
+    });
+  } catch (error) {
+    logger.error(`Error fetching prediction statistics: ${error.message}`);
+    res.status(500).json({
+      result: false,
+      message: "Internal Server Error",
+      error: error.message,
+    });
+  }
+});
 
 module.exports = router;

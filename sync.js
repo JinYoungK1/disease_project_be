@@ -3,6 +3,7 @@ const logger = require("./logs/logger");
 
 // 모델 import
 const LivestockDiseaseOccurrence = require("./models/reference/LivestockDiseaseOccurrence");
+const LivestockDiseasePrediction = require("./models/reference/LivestockDiseasePrediction");
 
 const syncDatabase = async () => {
   try {

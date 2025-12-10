@@ -862,24 +862,55 @@ router.get("/disease-occurrence/predict", async (req, res) => {
     const offset = (page - 1) * limit;
 
     const where = {};
+    
+    // 전염병명 필터
     if (req.query.lknts_nm) {
       where.lknts_nm = { [Op.like]: `%${req.query.lknts_nm}%` };
     }
+    
+    // 날짜 필터
     if (req.query.prediction_date) {
       where.prediction_date = { [Op.like]: `${req.query.prediction_date}%` };
     }
+    
+    // 날짜 범위 필터
+    if (req.query.startDate && req.query.endDate) {
+      where.prediction_date = {
+        [Op.between]: [req.query.startDate, req.query.endDate],
+      };
+    } else if (req.query.startDate) {
+      where.prediction_date = { [Op.gte]: req.query.startDate };
+    } else if (req.query.endDate) {
+      where.prediction_date = { [Op.lte]: req.query.endDate };
+    }
+    
+    // 오늘 이후 예측만 조회
+    if (req.query.upcoming === "true") {
+      const today = new Date();
+      const todayStr = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(2, "0")}${String(today.getDate()).padStart(2, "0")}`;
+      where.prediction_date = { [Op.gte]: todayStr };
+    }
+    
+    // 지역 필터
     if (req.query.region) {
       where.region = { [Op.like]: `%${req.query.region}%` };
     }
+    
+    // 위험도 필터
     if (req.query.risk_level) {
       where.risk_level = req.query.risk_level;
+    }
+    
+    // 신뢰도 필터 (최소 신뢰도)
+    if (req.query.min_confidence) {
+      where.confidence_score = { [Op.gte]: parseFloat(req.query.min_confidence) };
     }
 
     const { count, rows } = await LivestockDiseasePrediction.findAndCountAll({
       where,
       limit,
       offset,
-      order: [["prediction_date", "ASC"], ["risk_level", "DESC"]],
+      order: [["prediction_date", "ASC"], ["risk_level", "DESC"], ["confidence_score", "DESC"]],
     });
 
     // JSON 파싱
@@ -910,6 +941,224 @@ router.get("/disease-occurrence/predict", async (req, res) => {
     });
   } catch (error) {
     logger.error(`Error fetching predictions: ${error.message}`);
+    res.status(500).json({
+      result: false,
+      message: "Internal Server Error",
+      error: error.message,
+    });
+  }
+});
+
+// 전염병별 예측 목록 조회
+router.get("/disease-occurrence/predict/by-disease", async (req, res) => {
+  try {
+    const diseaseName = req.query.lknts_nm;
+    
+    if (!diseaseName) {
+      return res.status(400).json({
+        result: false,
+        message: "전염병명(lknts_nm) 파라미터가 필요합니다.",
+      });
+    }
+
+    const predictions = await LivestockDiseasePrediction.findAll({
+      where: {
+        lknts_nm: { [Op.like]: `%${diseaseName}%` },
+      },
+      order: [["prediction_date", "ASC"]],
+    });
+
+    // JSON 파싱
+    const result = predictions.map(row => {
+      const data = row.toJSON();
+      if (data.prediction_basis) {
+        try {
+          data.prediction_basis = JSON.parse(data.prediction_basis);
+        } catch (e) {
+          data.prediction_basis = {};
+        }
+      }
+      return data;
+    });
+
+    res.status(200).json({
+      result: true,
+      message: "전염병별 예측 데이터 조회 성공",
+      data: {
+        diseaseName,
+        predictions: result,
+        totalCount: result.length,
+      },
+    });
+  } catch (error) {
+    logger.error(`Error fetching predictions by disease: ${error.message}`);
+    res.status(500).json({
+      result: false,
+      message: "Internal Server Error",
+      error: error.message,
+    });
+  }
+});
+
+// 날짜별 예측 목록 조회
+router.get("/disease-occurrence/predict/by-date", async (req, res) => {
+  try {
+    const date = req.query.date; // YYYYMMDD 형식
+    
+    if (!date) {
+      return res.status(400).json({
+        result: false,
+        message: "날짜(date) 파라미터가 필요합니다. (YYYYMMDD 형식)",
+      });
+    }
+
+    const predictions = await LivestockDiseasePrediction.findAll({
+      where: {
+        prediction_date: date,
+      },
+      order: [["risk_level", "DESC"], ["confidence_score", "DESC"]],
+    });
+
+    // JSON 파싱
+    const result = predictions.map(row => {
+      const data = row.toJSON();
+      if (data.prediction_basis) {
+        try {
+          data.prediction_basis = JSON.parse(data.prediction_basis);
+        } catch (e) {
+          data.prediction_basis = {};
+        }
+      }
+      return data;
+    });
+
+    res.status(200).json({
+      result: true,
+      message: "날짜별 예측 데이터 조회 성공",
+      data: {
+        date,
+        predictions: result,
+        totalCount: result.length,
+      },
+    });
+  } catch (error) {
+    logger.error(`Error fetching predictions by date: ${error.message}`);
+    res.status(500).json({
+      result: false,
+      message: "Internal Server Error",
+      error: error.message,
+    });
+  }
+});
+
+// 위험도별 예측 목록 조회
+router.get("/disease-occurrence/predict/by-risk", async (req, res) => {
+  try {
+    const riskLevel = req.query.risk_level; // LOW, MEDIUM, HIGH, CRITICAL
+    
+    if (!riskLevel) {
+      return res.status(400).json({
+        result: false,
+        message: "위험도(risk_level) 파라미터가 필요합니다. (LOW, MEDIUM, HIGH, CRITICAL)",
+      });
+    }
+
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const offset = (page - 1) * limit;
+
+    const { count, rows } = await LivestockDiseasePrediction.findAndCountAll({
+      where: {
+        risk_level: riskLevel,
+      },
+      limit,
+      offset,
+      order: [["prediction_date", "ASC"], ["confidence_score", "DESC"]],
+    });
+
+    // JSON 파싱
+    const predictions = rows.map(row => {
+      const data = row.toJSON();
+      if (data.prediction_basis) {
+        try {
+          data.prediction_basis = JSON.parse(data.prediction_basis);
+        } catch (e) {
+          data.prediction_basis = {};
+        }
+      }
+      return data;
+    });
+
+    res.status(200).json({
+      result: true,
+      message: "위험도별 예측 데이터 조회 성공",
+      data: {
+        riskLevel,
+        list: predictions,
+        pagination: {
+          total: count,
+          page,
+          limit,
+          totalPages: Math.ceil(count / limit),
+        },
+      },
+    });
+  } catch (error) {
+    logger.error(`Error fetching predictions by risk: ${error.message}`);
+    res.status(500).json({
+      result: false,
+      message: "Internal Server Error",
+      error: error.message,
+    });
+  }
+});
+
+// 다가오는 예측 조회 (오늘 이후)
+router.get("/disease-occurrence/predict/upcoming", async (req, res) => {
+  try {
+    const days = parseInt(req.query.days) || 30; // 기본 30일
+    const today = new Date();
+    const futureDate = new Date(today);
+    futureDate.setDate(futureDate.getDate() + days);
+    
+    const todayStr = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(2, "0")}${String(today.getDate()).padStart(2, "0")}`;
+    const futureDateStr = `${futureDate.getFullYear()}${String(futureDate.getMonth() + 1).padStart(2, "0")}${String(futureDate.getDate()).padStart(2, "0")}`;
+
+    const predictions = await LivestockDiseasePrediction.findAll({
+      where: {
+        prediction_date: {
+          [Op.between]: [todayStr, futureDateStr],
+        },
+      },
+      order: [["prediction_date", "ASC"], ["risk_level", "DESC"]],
+    });
+
+    // JSON 파싱
+    const result = predictions.map(row => {
+      const data = row.toJSON();
+      if (data.prediction_basis) {
+        try {
+          data.prediction_basis = JSON.parse(data.prediction_basis);
+        } catch (e) {
+          data.prediction_basis = {};
+        }
+      }
+      return data;
+    });
+
+    res.status(200).json({
+      result: true,
+      message: `다가오는 ${days}일간의 예측 데이터 조회 성공`,
+      data: {
+        days,
+        fromDate: todayStr,
+        toDate: futureDateStr,
+        predictions: result,
+        totalCount: result.length,
+      },
+    });
+  } catch (error) {
+    logger.error(`Error fetching upcoming predictions: ${error.message}`);
     res.status(500).json({
       result: false,
       message: "Internal Server Error",

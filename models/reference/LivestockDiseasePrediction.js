@@ -10,9 +10,9 @@ const LivestockDiseasePrediction = sequelize.define(
       primaryKey: true,
     },
     prediction_date: {
-      type: DataTypes.STRING(8),
+      type: DataTypes.STRING(6),
       allowNull: false,
-      comment: "예상 발생일자 (YYYYMMDD) - 질병이 발생할 것으로 예측되는 날짜",
+      comment: "예상 발생월 (YYYYMM) - 질병이 발생할 것으로 예측되는 월",
     },
     lknts_nm: {
       type: DataTypes.STRING(100),

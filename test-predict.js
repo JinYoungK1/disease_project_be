@@ -8,7 +8,7 @@ async function generatePredictions() {
 
     const response = await axios.post(
       `${API_URL}/api/dashboard/disease-occurrence/predict`,
-      { months: 3 },
+      { months: 12 }, // 1년치 예측
       {
         headers: {
           "Content-Type": "application/json",
@@ -38,11 +38,19 @@ async function generatePredictions() {
 
     const predictions = sampleResponse.data.data.list;
     predictions.forEach((pred, index) => {
-      console.log(`${index + 1}. ${pred.lknts_nm} (${pred.prediction_date})`);
-      console.log(`   예상 발생: ${pred.predicted_livestock_count}마리`);
+      const year = pred.prediction_date.substring(0, 4);
+      const month = pred.prediction_date.substring(4, 6);
+      console.log(`${index + 1}. ${pred.lknts_nm} (${year}년 ${month}월)`);
+      console.log(`   예측 월: ${pred.prediction_date}`);
       console.log(`   신뢰도: ${pred.confidence_score}%`);
       console.log(`   위험도: ${pred.risk_level}`);
       console.log(`   지역: ${pred.region || "전체"}`);
+      if (pred.prediction_basis) {
+        const basis = typeof pred.prediction_basis === 'string' 
+          ? JSON.parse(pred.prediction_basis) 
+          : pred.prediction_basis;
+        console.log(`   예측 근거: ${basis.predictionReason || basis.reason || "데이터 기반"}`);
+      }
       console.log("");
     });
 

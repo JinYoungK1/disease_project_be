@@ -540,9 +540,9 @@ async function processAndUpsertRows(rows, status = null) {
 }
 
 // 질병 발생 예측 생성 함수 (재사용 가능하도록 분리)
-async function generatePredictions(months = 3) {
+async function generatePredictions(months = 12) {
   try {
-    logger.info(`질병 발생 예측 시작: ${months}개월 예측`);
+    logger.info(`질병 발생 예측 시작: ${months}개월 예측 (월별)`);
 
     // 기존 예측 데이터 삭제 (재생성)
     await LivestockDiseasePrediction.destroy({ where: {} });
@@ -563,30 +563,6 @@ async function generatePredictions(months = 3) {
     for (const disease of diseases) {
       const diseaseName = disease.lknts_nm;
       
-      // 전체 과거 데이터 분석 (제한 없이)
-      const allHistoricalData = await sequelize.query(
-        `SELECT 
-          SUBSTRING(occrrnc_de, 1, 4) AS year,
-          SUBSTRING(occrrnc_de, 5, 2) AS month,
-          occrrnc_de AS full_date,
-          COUNT(*) AS occurrence_count,
-          AVG(occrrnc_lvstckcnt) AS avg_livestock_count,
-          SUM(occrrnc_lvstckcnt) AS total_livestock_count,
-          STDDEV(occrrnc_lvstckcnt) AS std_dev
-        FROM livestock_disease_occurrence
-        WHERE lknts_nm = :diseaseName
-          AND occrrnc_de IS NOT NULL
-          AND occrrnc_lvstckcnt IS NOT NULL
-        GROUP BY SUBSTRING(occrrnc_de, 1, 4), SUBSTRING(occrrnc_de, 5, 2), occrrnc_de
-        ORDER BY year ASC, month ASC`,
-        {
-          replacements: { diseaseName },
-          type: QueryTypes.SELECT,
-        }
-      );
-
-      if (allHistoricalData.length === 0) continue;
-
       // 전체 통계 분석
       const overallStats = await sequelize.query(
         `SELECT 
@@ -607,6 +583,9 @@ async function generatePredictions(months = 3) {
       );
 
       const stats = overallStats[0];
+      const totalOccurrences = parseInt(stats.total_occurrences || 0);
+      
+      if (totalOccurrences === 0) continue;
 
       // 월별 상세 통계 (전체 데이터 기반)
       const monthlyStats = {};
@@ -627,7 +606,7 @@ async function generatePredictions(months = 3) {
         ORDER BY month ASC`,
         {
           replacements: { diseaseName },
-          type: QueryTypes.SELECT,
+        type: QueryTypes.SELECT,
         }
       );
 
@@ -643,27 +622,29 @@ async function generatePredictions(months = 3) {
         };
       });
 
-      // 발생 날짜 패턴 분석 (월별 발생 빈도)
-      const monthlyOccurrencePattern = {};
-      monthlyData.forEach(row => {
-        const month = parseInt(row.month);
-        monthlyOccurrencePattern[month] = {
-          occurrence_count: parseInt(row.occurrence_count || 0),
-          avg_days_between: 0, // 월별 평균 발생 간격
-        };
-      });
-
       // 전체 발생 빈도 계산
-      const totalOccurrences = parseInt(stats.total_occurrences || 0);
       const avgOccurrencesPerMonth = totalOccurrences / 12; // 월평균 발생 횟수
 
-      // 예측 생성 (다음 N개월 중 발생 가능한 날짜 예측)
+      // 예측 생성 (다음 N개월 중 발생 가능한 월 예측)
+      // 각 전염병별로 각 월마다 하나의 예측만 생성
       const currentDate = new Date(today);
       currentDate.setDate(1); // 월 초일로 설정
+      
+      // 각 전염병별로 각 월마다 하나의 예측만 생성하기 위한 Set
+      const diseaseMonthSet = new Set();
 
       while (currentDate <= endDate) {
         const year = currentDate.getFullYear();
         const month = currentDate.getMonth() + 1;
+        const monthKey = `${year}${String(month).padStart(2, "0")}`;
+        const uniqueKey = `${diseaseName}_${monthKey}`;
+        
+        // 이미 이 전염병에 대해 이 월의 예측이 생성되었으면 스킵
+        if (diseaseMonthSet.has(uniqueKey)) {
+          currentDate.setMonth(currentDate.getMonth() + 1);
+          continue;
+        }
+        diseaseMonthSet.add(uniqueKey);
 
         // 해당 월의 발생 패턴 분석
         const monthData = monthlyStats[month];
@@ -711,85 +692,29 @@ async function generatePredictions(months = 3) {
           else if (monthlyFrequency >= 5) riskLevel = "MEDIUM";
 
           basis = {
-            method: "date_pattern_analysis",
+            method: "monthly_pattern_analysis",
             monthlyOccurrenceFrequency: monthlyFrequency,
             monthlyRatio: monthlyRatio.toFixed(2),
             occurrenceProbability: occurrenceProbability,
             totalHistoricalOccurrences: totalOccurrences,
             avgOccurrencesPerMonth: avgOccurrencesPerMonth.toFixed(2),
-            dataPoints: allHistoricalData.length,
+            predictionReason: `과거 ${month}월에 ${monthlyFrequency}회 발생 (월평균 대비 ${(monthlyRatio * 100).toFixed(1)}%)`,
           };
 
-          // 해당 월에 발생 가능한 날짜들을 예측
-          // 과거 데이터에서 해당 월의 발생 날짜 패턴 분석
-          const historicalDates = await sequelize.query(
-            `SELECT 
-              SUBSTRING(occrrnc_de, 7, 2) AS day,
-              COUNT(*) AS occurrence_count
-            FROM livestock_disease_occurrence
-            WHERE lknts_nm = :diseaseName
-              AND SUBSTRING(occrrnc_de, 5, 2) = :month
-              AND occrrnc_de IS NOT NULL
-            GROUP BY SUBSTRING(occrrnc_de, 7, 2)
-            ORDER BY occurrence_count DESC
-            LIMIT 5`,
-            {
-              replacements: { 
-                diseaseName,
-                month: String(month).padStart(2, "0")
-              },
-              type: QueryTypes.SELECT,
-            }
-          );
+          // 월별 예측 데이터 생성 (YYYYMM 형식) - 각 전염병별로 각 월마다 하나만
+          const predictionDateStr = monthKey;
 
-          // 발생 가능한 날짜들 생성
-          if (historicalDates.length > 0) {
-            // 과거 발생 빈도가 높은 날짜들을 예측 날짜로 사용
-            for (const datePattern of historicalDates) {
-              const day = parseInt(datePattern.day);
-              const predictionDateStr = `${year}${String(month).padStart(2, "0")}${String(day).padStart(2, "0")}`;
-              
-              // 유효한 날짜인지 확인
-              const checkDate = new Date(year, month - 1, day);
-              if (checkDate.getMonth() === month - 1 && checkDate.getDate() === day) {
-                const dateBasis = {
-                  ...basis,
-                  historicalDayOccurrences: parseInt(datePattern.occurrence_count),
-                  predictionReason: `과거 ${month}월 ${day}일에 ${datePattern.occurrence_count}회 발생`,
-                };
-
-                predictions.push({
-                  prediction_date: predictionDateStr,
-                  lknts_nm: diseaseName,
-                  predicted_livestock_count: null,
-                  confidence_score: confidence,
-                  prediction_basis: JSON.stringify(dateBasis),
-                  region: null,
-                  risk_level: riskLevel,
-                });
-              }
-            }
-          } else {
-            // 과거 날짜 패턴이 없는 경우, 월 중순(15일)을 예측 날짜로 사용
-            const predictionDateStr = `${year}${String(month).padStart(2, "0")}15`;
-            const dateBasis = {
-              ...basis,
-              predictionReason: "과거 데이터 패턴 기반 월 중순 예측",
-            };
-
-            predictions.push({
-              prediction_date: predictionDateStr,
-              lknts_nm: diseaseName,
-              predicted_livestock_count: null,
-              confidence_score: Math.max(30, confidence - 20), // 신뢰도 조정
-              prediction_basis: JSON.stringify(dateBasis),
-              region: null,
-              risk_level: riskLevel,
-            });
-          }
+          predictions.push({
+            prediction_date: predictionDateStr,
+            lknts_nm: diseaseName,
+            predicted_livestock_count: null,
+            confidence_score: confidence,
+            prediction_basis: JSON.stringify(basis),
+            region: null,
+            risk_level: riskLevel,
+          });
         } else {
           // 해당 월에 과거 발생 데이터가 없는 경우, 낮은 신뢰도로 예측
-          const predictionDateStr = `${year}${String(month).padStart(2, "0")}15`;
           confidence = Math.min(30, Math.round((totalOccurrences / 500) * 30));
           
           basis = {
@@ -797,6 +722,8 @@ async function generatePredictions(months = 3) {
             totalOccurrences: totalOccurrences,
             reason: "해당 월에 과거 발생 데이터가 없음",
           };
+
+          const predictionDateStr = monthKey;
 
           predictions.push({
             prediction_date: predictionDateStr,
@@ -814,24 +741,75 @@ async function generatePredictions(months = 3) {
       }
     }
 
-    // 예측 데이터 일괄 저장
+    // 예측 데이터 일괄 저장 (중복 제거: 전염병명 + 예측월 조합)
+    let uniquePredictions = [];
     if (predictions.length > 0) {
-      await LivestockDiseasePrediction.bulkCreate(predictions, {
+      // 중복 제거: 같은 전염병 + 같은 월 조합은 하나만 유지 (마지막 것 유지)
+      const seen = new Map();
+      
+      for (const pred of predictions) {
+        const key = `${pred.lknts_nm}_${pred.prediction_date}`;
+        seen.set(key, pred); // 같은 키가 있으면 덮어쓰기 (마지막 것만 유지)
+      }
+      
+      uniquePredictions = Array.from(seen.values());
+      
+      // 기존 데이터 삭제 후 새로 생성
+      await LivestockDiseasePrediction.destroy({ where: {} });
+      
+      await LivestockDiseasePrediction.bulkCreate(uniquePredictions, {
         ignoreDuplicates: true,
       });
+      
+      logger.info(`중복 제거 후 ${uniquePredictions.length}개 예측 데이터 저장 (원본: ${predictions.length}개, 월별)`);
+      
+      // 데이터베이스 레벨에서 중복 데이터 제거 (안전장치)
+      // 같은 전염병 + 같은 월 조합 중 ID가 큰 것들을 삭제 (ID가 작은 것만 유지)
+      const beforeCount = await LivestockDiseasePrediction.count();
+      
+      // 중복 제거 쿼리 실행 (MySQL 문법)
+      await sequelize.query(
+        `DELETE t1 FROM livestock_disease_prediction t1
+         INNER JOIN (
+           SELECT MIN(id) as min_id, prediction_date, lknts_nm
+           FROM livestock_disease_prediction
+           GROUP BY prediction_date, lknts_nm
+         ) t2
+         ON t1.prediction_date = t2.prediction_date 
+         AND t1.lknts_nm = t2.lknts_nm
+         AND t1.id > t2.min_id`,
+        { type: QueryTypes.DELETE }
+      );
+      
+      // 중복 제거 후 최종 개수 확인
+      const afterCount = await LivestockDiseasePrediction.count();
+      const removedCount = beforeCount - afterCount;
+      logger.info(`데이터베이스 중복 제거 완료: 최종 ${afterCount}개 예측 데이터 (저장: ${uniquePredictions.length}개, 제거: ${removedCount}개)`);
+      
+      logger.info(`질병 발생 예측 완료: ${finalCount}개 예측 데이터 생성 (월별, 중복 제거 완료)`);
+
+      return {
+        result: true,
+        message: `질병 발생 예측이 완료되었습니다. ${finalCount}개의 예측 데이터가 생성되었습니다. (월별, 중복 제거 완료)`,
+        data: {
+          totalPredictions: finalCount,
+          months,
+          generatedAt: new Date().toISOString(),
+          removedDuplicates: removedCount,
+        },
+      };
+    } else {
+      // 예측 데이터가 없는 경우
+      return {
+        result: true,
+        message: `질병 발생 예측이 완료되었습니다. 예측할 데이터가 없습니다.`,
+        data: {
+          totalPredictions: 0,
+          months,
+          generatedAt: new Date().toISOString(),
+        },
+      };
     }
-
-    logger.info(`질병 발생 예측 완료: ${predictions.length}개 예측 데이터 생성`);
-
-    return {
-      result: true,
-      message: `질병 발생 예측이 완료되었습니다. ${predictions.length}개의 예측 데이터가 생성되었습니다.`,
-      data: {
-        totalPredictions: predictions.length,
-        months,
-        generatedAt: new Date().toISOString(),
-      },
-    };
   } catch (error) {
     logger.error(`Error generating predictions: ${error.message}`);
     throw error;
@@ -841,7 +819,7 @@ async function generatePredictions(months = 3) {
 // 질병 발생 예측 생성 API
 router.post("/disease-occurrence/predict", async (req, res) => {
   try {
-    const { months = 3 } = req.body; // 예측할 개월 수 (기본 3개월)
+    const { months = 12 } = req.body; // 예측할 개월 수 (기본 12개월, 1년)
     const result = await generatePredictions(months);
     res.status(200).json(result);
   } catch (error) {
@@ -868,12 +846,12 @@ router.get("/disease-occurrence/predict", async (req, res) => {
       where.lknts_nm = { [Op.like]: `%${req.query.lknts_nm}%` };
     }
     
-    // 날짜 필터
+    // 월 필터 (YYYYMM 형식)
     if (req.query.prediction_date) {
-      where.prediction_date = { [Op.like]: `${req.query.prediction_date}%` };
+      where.prediction_date = req.query.prediction_date; // 정확한 월 매칭
     }
     
-    // 날짜 범위 필터
+    // 월 범위 필터 (YYYYMM 형식)
     if (req.query.startDate && req.query.endDate) {
       where.prediction_date = {
         [Op.between]: [req.query.startDate, req.query.endDate],
@@ -887,7 +865,7 @@ router.get("/disease-occurrence/predict", async (req, res) => {
     // 오늘 이후 예측만 조회
     if (req.query.upcoming === "true") {
       const today = new Date();
-      const todayStr = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(2, "0")}${String(today.getDate()).padStart(2, "0")}`;
+      const todayStr = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(2, "0")}`;
       where.prediction_date = { [Op.gte]: todayStr };
     }
     
@@ -906,39 +884,95 @@ router.get("/disease-occurrence/predict", async (req, res) => {
       where.confidence_score = { [Op.gte]: parseFloat(req.query.min_confidence) };
     }
 
-    const { count, rows } = await LivestockDiseasePrediction.findAndCountAll({
-      where,
-      limit,
-      offset,
-      order: [["prediction_date", "ASC"], ["risk_level", "DESC"], ["confidence_score", "DESC"]],
-    });
+    // 그룹화 옵션 (기본값: true - 월별 + 질병별로 중복 제거)
+    const groupBy = req.query.groupBy !== "false"; // 기본값은 true
 
-    // JSON 파싱
-    const predictions = rows.map(row => {
-      const data = row.toJSON();
-      if (data.prediction_basis) {
-        try {
-          data.prediction_basis = JSON.parse(data.prediction_basis);
-        } catch (e) {
-          data.prediction_basis = {};
+    if (groupBy) {
+      // 그룹화하여 중복 제거: 먼저 필터링된 데이터를 가져온 후 그룹화
+      const allRows = await LivestockDiseasePrediction.findAll({
+        where,
+        order: [["prediction_date", "ASC"], ["risk_level", "DESC"], ["confidence_score", "DESC"], ["id", "ASC"]],
+      });
+
+      // 월별 + 질병별로 그룹화 (각 그룹에서 첫 번째 항목만 선택)
+      const groupedMap = new Map();
+      allRows.forEach(row => {
+        const key = `${row.prediction_date}_${row.lknts_nm}`;
+        if (!groupedMap.has(key)) {
+          groupedMap.set(key, row);
         }
-      }
-      return data;
-    });
+      });
 
-    res.status(200).json({
-      result: true,
-      message: "예측 데이터 조회 성공",
-      data: {
-        list: predictions,
-        pagination: {
-          total: count,
-          page,
-          limit,
-          totalPages: Math.ceil(count / limit),
+      const groupedList = Array.from(groupedMap.values());
+      const totalCount = groupedList.length;
+
+      // 페이지네이션 적용
+      const paginatedList = groupedList.slice(offset, offset + limit);
+
+      // JSON 파싱
+      const predictions = paginatedList.map(row => {
+        const data = row.toJSON();
+        if (data.prediction_basis) {
+          try {
+            data.prediction_basis = JSON.parse(data.prediction_basis);
+          } catch (e) {
+            data.prediction_basis = {};
+          }
+        }
+        return data;
+      });
+
+      res.status(200).json({
+        result: true,
+        message: "예측 데이터 조회 성공 (그룹화 적용)",
+        data: {
+          list: predictions,
+          pagination: {
+            total: totalCount,
+            page,
+            limit,
+            totalPages: Math.ceil(totalCount / limit),
+          },
+          grouped: true,
         },
-      },
-    });
+      });
+    } else {
+      // 그룹화 없이 일반 조회
+      const { count, rows } = await LivestockDiseasePrediction.findAndCountAll({
+        where,
+        limit,
+        offset,
+        order: [["prediction_date", "ASC"], ["risk_level", "DESC"], ["confidence_score", "DESC"]],
+      });
+
+      // JSON 파싱
+      const predictions = rows.map(row => {
+        const data = row.toJSON();
+        if (data.prediction_basis) {
+          try {
+            data.prediction_basis = JSON.parse(data.prediction_basis);
+          } catch (e) {
+            data.prediction_basis = {};
+          }
+        }
+        return data;
+      });
+
+      res.status(200).json({
+        result: true,
+        message: "예측 데이터 조회 성공",
+        data: {
+          list: predictions,
+          pagination: {
+            total: count,
+            page,
+            limit,
+            totalPages: Math.ceil(count / limit),
+          },
+          grouped: false,
+        },
+      });
+    }
   } catch (error) {
     logger.error(`Error fetching predictions: ${error.message}`);
     res.status(500).json({
@@ -1000,21 +1034,21 @@ router.get("/disease-occurrence/predict/by-disease", async (req, res) => {
   }
 });
 
-// 날짜별 예측 목록 조회
-router.get("/disease-occurrence/predict/by-date", async (req, res) => {
+// 월별 예측 목록 조회
+router.get("/disease-occurrence/predict/by-month", async (req, res) => {
   try {
-    const date = req.query.date; // YYYYMMDD 형식
+    const month = req.query.month; // YYYYMM 형식
     
-    if (!date) {
+    if (!month) {
       return res.status(400).json({
         result: false,
-        message: "날짜(date) 파라미터가 필요합니다. (YYYYMMDD 형식)",
+        message: "월(month) 파라미터가 필요합니다. (YYYYMM 형식)",
       });
     }
 
     const predictions = await LivestockDiseasePrediction.findAll({
       where: {
-        prediction_date: date,
+        prediction_date: month,
       },
       order: [["risk_level", "DESC"], ["confidence_score", "DESC"]],
     });
@@ -1033,16 +1067,16 @@ router.get("/disease-occurrence/predict/by-date", async (req, res) => {
     });
 
     res.status(200).json({
-      result: true,
-      message: "날짜별 예측 데이터 조회 성공",
-      data: {
-        date,
+        result: true,
+      message: "월별 예측 데이터 조회 성공",
+        data: {
+        month,
         predictions: result,
         totalCount: result.length,
       },
     });
   } catch (error) {
-    logger.error(`Error fetching predictions by date: ${error.message}`);
+    logger.error(`Error fetching predictions by month: ${error.message}`);
     res.status(500).json({
       result: false,
       message: "Internal Server Error",
@@ -1116,13 +1150,13 @@ router.get("/disease-occurrence/predict/by-risk", async (req, res) => {
 // 다가오는 예측 조회 (오늘 이후)
 router.get("/disease-occurrence/predict/upcoming", async (req, res) => {
   try {
-    const days = parseInt(req.query.days) || 30; // 기본 30일
+    const months = parseInt(req.query.months) || 6; // 기본 6개월
     const today = new Date();
     const futureDate = new Date(today);
-    futureDate.setDate(futureDate.getDate() + days);
+    futureDate.setMonth(futureDate.getMonth() + months);
     
-    const todayStr = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(2, "0")}${String(today.getDate()).padStart(2, "0")}`;
-    const futureDateStr = `${futureDate.getFullYear()}${String(futureDate.getMonth() + 1).padStart(2, "0")}${String(futureDate.getDate()).padStart(2, "0")}`;
+    const todayStr = `${today.getFullYear()}${String(today.getMonth() + 1).padStart(2, "0")}`;
+    const futureDateStr = `${futureDate.getFullYear()}${String(futureDate.getMonth() + 1).padStart(2, "0")}`;
 
     const predictions = await LivestockDiseasePrediction.findAll({
       where: {
@@ -1148,11 +1182,11 @@ router.get("/disease-occurrence/predict/upcoming", async (req, res) => {
 
     res.status(200).json({
       result: true,
-      message: `다가오는 ${days}일간의 예측 데이터 조회 성공`,
+      message: `다가오는 ${months}개월간의 예측 데이터 조회 성공`,
       data: {
-        days,
-        fromDate: todayStr,
-        toDate: futureDateStr,
+        months,
+        fromMonth: todayStr,
+        toMonth: futureDateStr,
         predictions: result,
         totalCount: result.length,
       },
@@ -1206,7 +1240,7 @@ router.get("/disease-occurrence/predict/statistics", async (req, res) => {
 cron.schedule("0 1 * * *", async () => {
   try {
     logger.info("⏰ 스케줄러: 자동 예측 생성 시작 (새벽 1시)");
-    const result = await generatePredictions(3); // 3개월 예측
+    const result = await generatePredictions(12); // 12개월(1년) 예측
     logger.info(`✅ 스케줄러: 자동 예측 생성 완료 - ${result.data.totalPredictions}개 예측 데이터 생성`);
   } catch (error) {
     logger.error(`❌ 스케줄러: 자동 예측 생성 실패 - ${error.message}`);
@@ -1216,6 +1250,6 @@ cron.schedule("0 1 * * *", async () => {
   timezone: "Asia/Seoul", // 한국 시간대
 });
 
-logger.info("📅 예측 자동 스케줄러가 등록되었습니다. (매일 새벽 1시 실행)");
+logger.info("📅 예측 자동 스케줄러가 등록되었습니다. (매일 새벽 1시 실행, 1년치 예측)");
 
 module.exports = router;
